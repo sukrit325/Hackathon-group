@@ -1,10 +1,11 @@
-"""Pydantic models for request/response validation and LLM output."""
+"""Pydantic models for API request/response validation and LLM output parsing."""
 from __future__ import annotations
 
 import re
 from typing import List, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, HttpUrl, field_validator
+
 
 _DOMAIN_RE = re.compile(r"^(?!-)[a-z0-9-]{1,63}(?<!-)(\.[a-z0-9-]{1,63})+$", re.I)
 _MAX_NAME = 120
@@ -17,19 +18,23 @@ class Persona(BaseModel):
 
     @field_validator("name")
     @classmethod
-    def _normalize_name(cls, value: str) -> str:
-        value = value.strip()
-        if not value:
+    def _normalize_name(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
             raise ValueError("name must not be empty")
-        return value
+        return v
 
     @field_validator("domain")
     @classmethod
-    def _normalize_domain(cls, value: str) -> str:
-        value = value.strip().lower()
-        if not _DOMAIN_RE.match(value):
-            raise ValueError("domain must look like a hostname")
-        return value
+    def _normalize_domain(cls, v: str) -> str:
+        v = v.strip().lower()
+        # Strip a scheme if the client provided one.
+        if "://" in v:
+            v = v.split("://", 1)[1]
+        v = v.split("/", 1)[0]
+        if not _DOMAIN_RE.match(v):
+            raise ValueError("domain must be a valid DNS domain")
+        return v
 
 
 class AgentInitRequest(BaseModel):
@@ -40,28 +45,31 @@ class AgentInitResponse(BaseModel):
     agentId: str
 
 
-class PostOut(BaseModel):
+class FeedPost(BaseModel):
     id: str
-    agent_id: str
-    title: str
-    body: str
-    source_url: str
-    source_urls: List[str]
-    created_at: str
+    createdAt: str
+    text: str
+    rationale: str
+    sources: List[str]
 
 
 class FeedResponse(BaseModel):
-    posts: List[PostOut]
+    posts: List[FeedPost]
 
+
+# ---- LLM structured output ----------------------------------------------
 
 class EditorialDecision(BaseModel):
-    title: str = Field(..., min_length=1, max_length=200)
-    body: str = Field(..., min_length=1, max_length=6000)
-    source_url: str = Field(..., min_length=1)
-    source_urls: List[str] = Field(default_factory=list)
-    reason: str = Field(default="")
+    """Strict schema for the LLM's editorial decision."""
+    decision: Literal["PUBLISH", "REJECT"]
+    title: str | None = None
+    text: str | None = None
+    rationale: str
+    sources: List[str] = Field(default_factory=list)
 
-    @field_validator("source_urls")
+    @field_validator("rationale")
     @classmethod
-    def _ensure_sources(cls, value: List[str]) -> List[str]:
-        return [item.strip() for item in value if item and item.strip()]
+    def _rationale_nonempty(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("rationale must not be empty")
+        return v.strip()

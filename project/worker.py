@@ -1,12 +1,23 @@
-"""Per-agent worker pipeline."""
+"""Per-agent worker pipeline.
+
+Each tick:
+  verify agent -> acquire lock -> discover -> normalize -> dedup ->
+  retrieve memory -> LLM editorial decision -> validate -> source integrity ->
+  content normalization -> hash -> atomic insert -> release lock.
+
+Failure of any stage is logged; the lock is always released; APScheduler and
+FastAPI are never crashed by a worker exception.
+"""
 from __future__ import annotations
 
 import asyncio
 import hashlib
 import logging
+import re
+import time
 import uuid
 from datetime import datetime, timezone
-from typing import Any
+from typing import Optional
 
 import db
 import discovery
@@ -16,115 +27,176 @@ from schemas import EditorialDecision
 
 logger = logging.getLogger("worker")
 
+# Per-agent in-process locks. Created lazily under a guard lock to prevent
+# two coroutines from creating two locks for the same agent.
 _agent_locks: dict[str, asyncio.Lock] = {}
 _locks_guard = asyncio.Lock()
 
 
 async def _get_agent_lock(agent_id: str) -> asyncio.Lock:
     async with _locks_guard:
-        lock = _agent_locks.get(agent_id)
-        if lock is None:
-            lock = asyncio.Lock()
-            _agent_locks[agent_id] = lock
-        return lock
+        lk = _agent_locks.get(agent_id)
+        if lk is None:
+            lk = asyncio.Lock()
+            _agent_locks[agent_id] = lk
+        return lk
 
 
-def _candidate_to_dict(candidate: Any) -> dict[str, Any]:
-    if isinstance(candidate, dict):
-        return candidate
-    if hasattr(candidate, "to_dict"):
-        return candidate.to_dict()
-    return {"title": str(candidate), "summary": "", "source_url": "", "published_at": "", "source_name": ""}
+_WS_RE = re.compile(r"\s+")
 
 
-def _normalize_content(value: str, max_length: int) -> str:
-    value = " ".join(value.split()).strip()
-    if len(value) > max_length:
-        value = value[: max_length - 1].rstrip() + "…"
-    return value
+def normalize_text(t: str) -> str:
+    return _WS_RE.sub(" ", (t or "")).strip().lower()
 
 
-def _validate_decision(decision: EditorialDecision, candidates: list[dict[str, Any]]) -> bool:
-    settings = get_settings()
-    candidate_urls = {candidate.get("source_url", "") for candidate in candidates if candidate.get("source_url")}
-    if not decision.source_url:
-        return False
-    if decision.source_url not in candidate_urls:
-        return False
-    if not decision.source_urls:
-        return False
-    if any(url not in candidate_urls for url in decision.source_urls):
-        return False
-    if not (settings.min_title_length <= len(decision.title) <= settings.max_title_length):
-        return False
-    if not (settings.min_post_length <= len(decision.body) <= settings.max_post_length):
-        return False
-    return True
+def content_hash(title: str, text: str) -> str:
+    h = hashlib.sha256()
+    h.update(normalize_text(title).encode("utf-8"))
+    h.update(b"|")
+    h.update(normalize_text(text).encode("utf-8"))
+    return h.hexdigest()
 
 
-async def run_worker_tick(agent_id: str) -> bool:
-    settings = get_settings()
-    agent = db.get_agent(agent_id)
-    if not agent or not agent.get("is_active"):
-        logger.warning("Agent %s not found or inactive", agent_id)
-        return False
+def _validate_decision(raw: dict, candidate_urls: set[str]) -> EditorialDecision:
+    """Validate LLM output strictly. Raises ValueError on any violation."""
+    if not isinstance(raw, dict):
+        raise ValueError("LLM output is not a JSON object")
+    try:
+        d = EditorialDecision.model_validate(raw)
+    except Exception as exc:
+        raise ValueError(f"LLM output schema invalid: {exc}") from exc
 
-    lock = await _get_agent_lock(agent_id)
-    async with lock:
-        candidates = await discovery.discover()
-        if not candidates:
-            logger.info("No candidates discovered for %s", agent_id)
-            return False
+    if d.decision == "PUBLISH":
+        s = get_settings()
+        if not d.title or len(d.title) < s.min_title_length:
+            raise ValueError("title too short")
+        if len(d.title) > s.max_title_length:
+            raise ValueError("title too long")
+        if not d.text or len(d.text) < s.min_post_length:
+            raise ValueError("text too short")
+        if len(d.text) > s.max_post_length:
+            raise ValueError("text too long")
+        if not isinstance(d.sources, list):
+            raise ValueError("sources must be a list")
+        if len(d.sources) < s.min_sources or len(d.sources) > s.max_sources:
+            raise ValueError("source count out of bounds")
+        # Source integrity: every source URL must come from the discovered set.
+        for u in d.sources:
+            nu = discovery.normalize_url(u)
+            if not nu or nu not in candidate_urls:
+                raise ValueError(f"unknown source URL: {u}")
+    return d
 
-        normalized_candidates = []
-        for candidate in candidates[: settings.top_n_candidates]:
-            item = _candidate_to_dict(candidate)
-            item["title"] = _normalize_content(item.get("title", ""), settings.max_title_length)
-            item["summary"] = _normalize_content(item.get("summary", ""), 1200)
-            normalized_candidates.append(item)
 
-        memory = db.list_posts(agent_id, limit=5)
-        provider = llm.MockProvider() if settings.llm_provider.lower() == "mock" or not settings.llm_api_key else llm.OpenAIProvider()
-        try:
-            raw_decision = await provider.generate_editorial_decision(
-                normalized_candidates,
-                memory,
-                agent["name"],
-                agent["domain"],
+async def run_worker_tick(
+    agent_id: str,
+    db_path: Optional[str] = None,
+    provider: Optional[llm.LLMProvider] = None,
+) -> None:
+    """Execute one worker tick for an agent. Never raises."""
+    start = time.monotonic()
+    log_ctx = {"agent_id": agent_id}
+    try:
+        agent = db.get_agent(agent_id, db_path=db_path)
+        if not agent:
+            logger.warning("worker tick for unknown agent %s", agent_id, extra=log_ctx)
+            return
+        if not agent["active"]:
+            logger.info("worker tick for inactive agent %s; skipping", agent_id, extra=log_ctx)
+            return
+
+        lock = await _get_agent_lock(agent_id)
+        # APScheduler max_instances=1 already prevents overlap for scheduled
+        # runs, but the immediate first-run task bypasses the scheduler. The
+        # asyncio.Lock closes that gap.
+        async with lock:
+            log_ctx["agent_name"] = agent["name"]
+            logger.info("worker tick start", extra=log_ctx)
+            settings = get_settings()
+
+            # Discovery
+            try:
+                candidates = await discovery.discover()
+            except Exception as exc:
+                logger.error("discovery failed: %s", exc, extra=log_ctx)
+                return
+            if not candidates:
+                logger.info("no candidates; ending tick", extra=log_ctx)
+                return
+
+            # Dedup + top-N selection
+            top_n = candidates[: settings.top_n_candidates]
+            cand_dicts = [c.to_dict() for c in top_n]
+            candidate_urls = {c.source_url for c in top_n}
+
+            # Memory retrieval (capped at 10)
+            memory = db.recent_posts_for_memory(agent_id, limit=10, db_path=db_path)
+
+            # LLM call (bounded retries inside provider)
+            prov = provider or llm.get_provider()
+            try:
+                raw = await prov.generate_editorial_decision(
+                    candidates=cand_dicts,
+                    memory=memory,
+                    persona_name=agent["name"],
+                    persona_domain=agent["domain"],
+                )
+            except llm.LLMError as exc:
+                logger.error("LLM failed: %s", exc, extra=log_ctx)
+                return
+            except Exception as exc:
+                # Defensive: provider contract violations must not escape.
+                logger.exception("LLM provider raised unexpected error: %s", exc)
+                return
+
+            # Strict validation
+            try:
+                decision = _validate_decision(raw, candidate_urls)
+            except ValueError as exc:
+                logger.warning("LLM output rejected: %s | raw=%s", exc, raw, extra=log_ctx)
+                return
+
+            if decision.decision == "REJECT":
+                logger.info(
+                    "REJECT | rationale=%s", decision.rationale, extra=log_ctx
+                )
+                return
+
+            # Content normalization + hash
+            title = decision.title.strip()
+            text = decision.text.strip()
+            sources = [discovery.normalize_url(u) for u in decision.sources]
+            sources = [u for u in sources if u]  # defensive
+            chash = content_hash(title, text)
+            post_id = str(uuid.uuid4())
+            created_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+            # Atomic persistence; UNIQUE(agent_id, content_hash) is the durable
+            # deduplication boundary.
+            inserted = db.insert_post(
+                post_id=post_id,
+                agent_id=agent_id,
+                created_at=created_at,
+                title=title,
+                text=text,
+                rationale=decision.rationale.strip(),
+                sources=sources,
+                content_hash=chash,
+                db_path=db_path,
             )
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("LLM generation failed for %s: %s", agent_id, exc)
-            return False
-
-        try:
-            decision = EditorialDecision.model_validate(raw_decision)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Editorial decision invalid for %s: %s", agent_id, exc)
-            return False
-
-        if not _validate_decision(decision, normalized_candidates):
-            logger.warning("Editorial decision rejected for %s due to validation", agent_id)
-            return False
-
-        title = _normalize_content(decision.title, settings.max_title_length)
-        body = _normalize_content(decision.body, settings.max_post_length)
-        source_url = decision.source_url
-        source_urls = [url for url in decision.source_urls if url] or [source_url]
-        content_hash = hashlib.sha256(f"{title}\n{body}\n{','.join(source_urls)}".encode("utf-8")).hexdigest()
-        post_id = uuid.uuid4().hex
-        created_at = datetime.now(timezone.utc).isoformat()
-        inserted = db.insert_post(
-            post_id,
-            agent_id,
-            created_at,
-            title,
-            body,
-            source_url,
-            source_urls,
-            content_hash,
-        )
-        if inserted:
-            logger.info("Inserted new post for %s", agent_id)
-        else:
-            logger.info("Duplicate post skipped for %s", agent_id)
-        return inserted
+            if inserted:
+                logger.info(
+                    "PUBLISHED | post_id=%s | hash=%s | sources=%d",
+                    post_id, chash[:12], len(sources), extra=log_ctx,
+                )
+            else:
+                logger.info(
+                    "DUPLICATE prevented by UNIQUE constraint | hash=%s",
+                    chash[:12], extra=log_ctx,
+                )
+    except Exception:
+        # Last-resort guard: a worker tick must never crash the scheduler.
+        logger.exception("worker tick unhandled exception for agent %s", agent_id)
+    finally:
+        dur = time.monotonic() - start
+        logger.info("worker tick end | duration=%.2fs", dur, extra=log_ctx)
