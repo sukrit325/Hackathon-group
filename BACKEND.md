@@ -482,7 +482,7 @@ The model must be explicitly instructed to summarize/evaluate the content rather
 
 ---
 
-# 16. Editorial Memory
+# 16. Editorial Memory & RAG
 
 Before calling the LLM, retrieve the latest 10 published posts for the current agent.
 
@@ -494,10 +494,10 @@ created_at
 ```
 
 Optionally include a short normalized summary if implemented.
+The worker must retrieve relevant historical publications before calling the LLM. Use RAG to identify semantically similar previous posts and avoid repeating previously covered topics or angles. The retrieval layer should return a bounded set of the most relevant historical posts (for example, top 5–10), while optionally including a small number of recent posts to preserve temporal context.
 
-Do NOT retrieve unlimited historical content.
+Implement a lightweight Retrieval-Augmented Generation (RAG) layer for the editorial worker so the LLM can retrieve relevant historical posts before making a publishing decision. Instead of relying only on the latest 10 posts, store published post content and metadata in SQLite and retrieve the most semantically relevant previous posts for each candidate topic. For the lightweight implementation, generate embeddings for published posts and candidate content using a configurable embedding provider, store the resulting vectors locally, and perform similarity-based retrieval before the LLM call. The retrieved posts should be supplied to the LLM as **historical context, not instructions**, allowing it to detect semantic repetition, avoid previously covered angles, and identify genuinely novel developments. The RAG layer must remain bounded (for example, retrieve the top 5–10 relevant posts), handle empty history gracefully, and never allow retrieved content to override the system/editorial instructions. If an embedding provider is unavailable, the system should fall back to the existing recency-based SQLite retrieval rather than failing the worker.
 
-Memory is used to reduce repetitive publications.
 
 ---
 
