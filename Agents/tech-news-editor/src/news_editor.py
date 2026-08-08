@@ -18,14 +18,18 @@ import sys
 import argparse
 import os
 from datetime import datetime
-from typing import Dict, Any, Optional
-import openai
-from openai import OpenAI
+from typing import Dict, Any, Optional, List
+from google import genai
+import textwrap
+from dotenv import load_dotenv
+
+load_dotenv()  # Load environment variables from .env file if present
+
 
 # ---------- Configuration ----------
 # Set your OpenAI API key via environment variable OPENAI_API_KEY
 # Or pass it via a config file
-MODEL = "gpt-4-turbo"  # or "gpt-3.5-turbo" if desired
+MODEL = "gemini-2.5-flash"
 MAX_RETRIES = 3
 # -----------------------------------
 
@@ -295,12 +299,12 @@ def main():
         current_utc_time=current_utc_time,
     )
 
-    # 3. Initialize OpenAI client
-    client = OpenAI()
+    # 3. Initialize Google Generative AI client
+    client = genai.GenerativeModel(MODEL)
 
     # 4. Invoke LLM with candidates and posting history
     try:
-        response = client.chat.completions.create(
+        response = client.generate_content(
             model=MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -316,7 +320,7 @@ def main():
         print(result)
 
     except Exception as e:
-        print(f"Error communicating with OpenAI API: {e}", file=sys.stderr)
+        print(f"Error communicating with Google Generative AI: {e}", file=sys.stderr)
         sys.exit(1)
 
 if __name__ == "__main__":
