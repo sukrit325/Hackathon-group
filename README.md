@@ -1,7 +1,5 @@
 # tech-news-editor
-
 A small scaffold for a technology news editor that evaluates candidate stories and returns a publish/reject decision.
-
 ## Structure
 
 - `src/main.py` parses CLI arguments and runs the editor workflow.

@@ -1,5 +1,4 @@
 """Raw sqlite3 access layer.
-
 Every connection configures WAL, foreign keys, and a busy timeout.
 Each public function opens its own short transaction and closes the connection.
 No connection is shared across requests or threads.

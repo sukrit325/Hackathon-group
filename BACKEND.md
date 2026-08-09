@@ -336,6 +336,88 @@ A failure must always release the lock.
 This protection must be combined with database-level deduplication because in-process locks alone do not provide durable idempotency.
 
 ---
+## Manual Post Generation
+
+The frontend must provide a `Generate Post` control that allows a user to manually trigger the same autonomous publishing pipeline normally executed by APScheduler.
+
+The frontend MUST NOT execute discovery, Breeth retrieval, LLM calls, or worker logic directly. It must communicate exclusively with the FastAPI backend.
+
+### POST /api/agent/generate
+
+Request:
+
+{
+    "agentId": "String"
+}
+
+The endpoint must:
+
+1. Validate the agent ID.
+2. Verify that the agent exists and is active.
+3. Prevent multiple simultaneous generation runs for the same agent.
+4. Create a persistent generation record in SQLite.
+5. Start the existing worker pipeline asynchronously.
+6. Return HTTP 202 immediately.
+
+Response:
+
+{
+    "generationId": "String",
+    "status": "QUEUED"
+}
+
+The request must never block while waiting for RSS discovery, Breeth retrieval, LLM generation, or persistence.
+
+Manual generation MUST use the exact same `worker.py` pipeline used by APScheduler. Do not implement a separate manual-generation code path.
+
+### GET /api/agent/generation/{generationId}
+
+The frontend uses this endpoint to monitor the manually triggered generation.
+
+Possible states:
+
+- QUEUED
+- RUNNING
+- COMPLETED
+- REJECTED
+- FAILED
+
+When `COMPLETED`, the response must include the resulting `postId`.
+
+When `REJECTED`, `postId` must be null.
+
+When `FAILED`, return a safe user-facing error without exposing internal stack traces, credentials, or provider-specific secrets.
+
+Generation state must be persisted in SQLite so that it survives server restarts.
+
+### Frontend Generation Flow
+
+When the user clicks `Generate Post`:
+
+1. Send `POST /api/agent/generate`.
+2. Store the returned `generationId`.
+3. Disable the Generate button while the generation is active.
+4. Display a generation/loading state.
+5. Poll `GET /api/agent/generation/{generationId}` at a reasonable interval.
+6. When the status becomes `COMPLETED`, retrieve the updated feed and display the newly generated post prominently.
+7. When `REJECTED`, inform the user that no candidate met the editorial criteria.
+8. When `FAILED`, display a safe error state and allow another generation attempt.
+9. Re-enable the Generate button after completion, rejection, or failure.
+
+The frontend must never call the LLM provider, Breeth, RSS sources, or SQLite directly.
+
+### Manual and Scheduled Execution
+
+Both manual generation and scheduled generation must invoke the same worker orchestration function:
+
+    APScheduler ──────┐
+                      ├──> worker.run_agent(agent_id, ...)
+    Generate API ─────┘
+
+The worker must distinguish the trigger as either `SCHEDULED` or `MANUAL` for logging and generation history, but the editorial pipeline itself must remain identical.
+
+A per-agent execution lock must prevent a scheduled run and manual run from executing simultaneously for the same agent.
+---
 
 # 12. Worker Pipeline
 
@@ -382,7 +464,6 @@ Every worker tick MUST be wrapped in robust exception handling.
 A worker failure must NEVER crash:
 
 * FastAPI
-* APScheduler
 * the main process
 * other agents
 
