@@ -1,0 +1,12 @@
+python-dotenv
+google-genai
+bs4
+fastapi
+uvicorn[standard]
+httpx
+feedparser
+pydantic
+pytest
+pytest-asyncio
+lxml
+aiohttp

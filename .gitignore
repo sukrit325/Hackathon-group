@@ -1,1 +1,14 @@
-src/.env.example
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+*.log
+.env
+pycache/
+*.py[cod]
+.vscode/
+*.egg-info/
+build/
+dist/
+.DS_Store
+Thumbs.dbsrc/.env.example
