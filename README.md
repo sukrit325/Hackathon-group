@@ -18,4 +18,4 @@ A small scaffold for a technology news editor that evaluates candidate stories a
    ```bash
    python -m src.main --input data/sample_input.json
    ```
-3. Optional: copy `.env.example` to `.env` and set your API key if you later wire up a real LLM backend.
+3. Optional: copy `.env.example` to `.env` and set your API key if you later wire up a real LLM backend.2

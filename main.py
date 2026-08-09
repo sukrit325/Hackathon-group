@@ -1,21 +1,13 @@
-"""FastAPI application: autonomous publisher backend (single-request pipeline)."""
-
+"""FastAPI application: autonomous publisher backend."""
 from __future__ import annotations
-
-import json
 import logging
 import os
-import sys
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
-
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from uvicorn import lifespan
-
 import db
 import worker
 from config import get_settings
@@ -24,10 +16,10 @@ from schemas import (
     AgentInitResponse,
     FeedPost,
     FeedResponse,
+    GenerateRequest,
+    GenerateResponse,
+    GenerationStatusResponse,
 )
-
-# REMOVE THIS IMPORT - worker.py handles the agent
-# from Agents.src.news_editor import build_system_prompt, call_llm, validate_decision
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -35,10 +27,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger("main")
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    db.init_db()
+    logger.info("Database initialized on startup.")
+    yield
 
-# ---------------------------------------------------------------------------
-# Auth dependency
-# ---------------------------------------------------------------------------
+app = FastAPI(lifespan=lifespan)
 
 def require_api_key(x_api_key: Optional[str] = Header(default=None)) -> None:
     s = get_settings()
@@ -50,14 +45,6 @@ def require_api_key(x_api_key: Optional[str] = Header(default=None)) -> None:
             detail="invalid or missing API key",
         )
 
-
-# ---------------------------------------------------------------------------
-# App
-# ---------------------------------------------------------------------------
-
-app = FastAPI(title="Autonomous Publisher", lifespan=lifespan)
-    
-
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception):
     logger.exception("unhandled exception on %s %s", request.method, request.url.path)
@@ -66,28 +53,34 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
         content={"detail": "internal server error"},
     )
 
+@app.post("/api/agent/curate", dependencies=[Depends(require_api_key)])
+def curate_agent():
+    return {"status": "healthy"}
 
-# ---------------------------------------------------------------------------
-# API Endpoints
-# ---------------------------------------------------------------------------
+async def _execute_pipeline_task(agent_id: str, generation_id: Optional[str] = None) -> None:
+    try:
+        logger.info(f"Running background publishing pipeline for agent {agent_id}")
+        await worker.run_pipeline(agent_id, generation_id=generation_id, trigger="SCHEDULED")
+        logger.info(f"Pipeline completed for agent {agent_id}")
+    except Exception as e:
+        logger.exception(f"Pipeline background execution failed for agent {agent_id}: {e}")
 
-@app.post("/api/agent/init", response_model=AgentInitResponse)
+@app.post(
+    "/api/agent/init",
+    response_model=AgentInitResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
 async def init_agent(
     body: AgentInitRequest,
+    background_tasks: BackgroundTasks,
     idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
     _: None = Depends(require_api_key),
 ):
-    """
-    Initialize an agent and immediately run the complete publishing pipeline.
-    This request blocks until the first generation finishes.
-    """
-    # Idempotency replay
     if idempotency_key:
         cached = db.lookup_idempotency(idempotency_key)
         if cached is not None:
             return AgentInitResponse(agentId=cached["agent_id"])
 
-    # Rate limiting
     s = get_settings()
     if db.count_active_agents() >= s.max_active_agents:
         raise HTTPException(
@@ -95,7 +88,6 @@ async def init_agent(
             f"max active agents ({s.max_active_agents}) reached",
         )
 
-    # Create agent
     agent_id = db.new_uuid()
     created_at = db.now_utc_iso()
     db.insert_agent(
@@ -104,27 +96,73 @@ async def init_agent(
         domain=body.persona.domain,
         created_at=created_at,
     )
-    
+
     if idempotency_key:
         resp = {"agentId": agent_id}
         db.save_idempotency(idempotency_key, agent_id, resp, created_at)
 
-    # Run the publishing pipeline immediately (blocking)
-    try:
-        logger.info(f"Running publishing pipeline for agent {agent_id}")
-        await worker.run_pipeline(agent_id)
-        logger.info(f"Pipeline completed for agent {agent_id}")
-    except Exception as e:
-        logger.exception(f"Pipeline failed for agent {agent_id}: {e}")
-        # Mark agent as inactive if pipeline fails
-        db.set_agent_active(agent_id, 0)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Publishing pipeline failed: {str(e)}"
-        )
-
+    background_tasks.add_task(_execute_pipeline_task, agent_id)
     return AgentInitResponse(agentId=agent_id)
 
+@app.post(
+    "/api/agent/generate",
+    response_model=GenerateResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def generate_post(
+    body: GenerateRequest,
+    background_tasks: BackgroundTasks,
+    _: None = Depends(require_api_key),
+):
+    agent = db.get_agent(body.agentId)
+    if agent is None:
+        raise HTTPException(status_code=404, detail="agent not found")
+    if not agent.get("active", 1):
+        raise HTTPException(status_code=400, detail="agent is not active")
+
+    active_gen = db.get_active_generation_for_agent(body.agentId)
+    if active_gen:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A generation task is already queued or running for this agent",
+        )
+
+    generation_id = db.new_uuid()
+    created_at = db.now_utc_iso()
+    db.insert_generation(
+        generation_id=generation_id,
+        agent_id=body.agentId,
+        status="QUEUED",
+        created_at=created_at,
+    )
+
+    background_tasks.add_task(
+        worker.run_pipeline,
+        agent_id=body.agentId,
+        generation_id=generation_id,
+        trigger="MANUAL",
+    )
+
+    return GenerateResponse(generationId=generation_id, status="QUEUED")
+
+@app.get(
+    "/api/agent/generation/{generationId}",
+    response_model=GenerationStatusResponse,
+)
+async def get_generation_status(
+    generationId: str,
+    _: None = Depends(require_api_key),
+):
+    gen = db.get_generation(generationId)
+    if gen is None:
+        raise HTTPException(status_code=404, detail="generation not found")
+
+    return GenerationStatusResponse(
+        generationId=gen["id"],
+        status=gen["status"],
+        postId=gen.get("post_id"),
+        error=gen.get("error_message"),
+    )
 
 @app.get("/api/agent/feed", response_model=FeedResponse)
 async def get_feed(
@@ -134,14 +172,15 @@ async def get_feed(
     before_id: Optional[str] = Query(default=None),
     _: None = Depends(require_api_key),
 ):
-    """
-    Strictly passive feed endpoint.
-    No generation, no side effects.
-    Read only from SQLite.
-    """
     agent = db.get_agent(agentId)
     if agent is None:
-        raise HTTPException(404, "agent not found")
+        raise HTTPException(status_code=404, detail="agent not found")
+
+    if bool(before_created_at) != bool(before_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Both 'before_created_at' and 'before_id' must be provided together for pagination.",
+        )
 
     before = None
     if before_created_at and before_id:
@@ -161,20 +200,17 @@ async def get_feed(
         ]
     )
 
-
 @app.delete("/api/agent/{agent_id}")
 async def deactivate_agent(agent_id: str, _: None = Depends(require_api_key)):
-    """Deactivate an agent (soft delete)."""
     agent = db.get_agent(agent_id)
     if agent is None:
-        raise HTTPException(404, "agent not found")
+        raise HTTPException(status_code=404, detail="agent not found")
     db.set_agent_active(agent_id, 0)
     return {"ok": True}
 
-
-# Mount static files LAST so API routes take precedence.
-app.mount("/", StaticFiles(directory="static", html=True), name="static")
-
+static_path = Path("Agents/src/static")
+if static_path.is_dir():
+    app.mount("/static", StaticFiles(directory=str(static_path), html=True), name="static")
 
 if __name__ == "__main__":
     import uvicorn

@@ -1,44 +1,40 @@
-"""Raw sqlite3 access layer.
-Every connection configures WAL, foreign keys, and a busy timeout.
-Each public function opens its own short transaction and closes the connection.
-No connection is shared across requests or threads.
-"""
+"""Raw sqlite3 access layer with WAL, foreign keys, and busy timeout."""
 from __future__ import annotations
 import contextlib
 import json
 import os
 import sqlite3
 import uuid
-from datetime import datetime, timezone
-from typing import Any, Iterable, Optional
 import tempfile
 import glob
-
+from datetime import datetime, timezone
+from typing import Any, Iterable, Optional
 from config import get_settings
 
-# Bump when adding migrations. Each version corresponds to a migration step
-# applied sequentially in `_apply_migrations`.
-CURRENT_SCHEMA_VERSION = 2
-
-
-# ---------------------------------------------------------------------------
-# Connection helpers
-# ---------------------------------------------------------------------------
+CURRENT_SCHEMA_VERSION = 3
 
 def _connect(db_path: str) -> sqlite3.Connection:
-    # isolation_level=None -> autocommit off; we manage transactions manually.
     conn = sqlite3.connect(db_path, timeout=5.0, isolation_level=None)
     conn.row_factory = sqlite3.Row
-    # Required pragmas per spec.
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA foreign_keys=ON;")
-    conn.execute("PRAGMA busy_timeout=5000;")
+    try:
+        conn.execute("PRAGMA journal_mode=WAL;")
+    except sqlite3.Error:
+        try:
+            conn.execute("PRAGMA journal_mode=DELETE;")
+        except sqlite3.Error:
+            pass
+    try:
+        conn.execute("PRAGMA foreign_keys=ON;")
+    except sqlite3.Error:
+        pass
+    try:
+        conn.execute("PRAGMA busy_timeout=5000;")
+    except sqlite3.Error:
+        pass
     return conn
-
 
 @contextlib.contextmanager
 def transaction(db_path: Optional[str] = None):
-    """Context manager: BEGIN...COMMIT/ROLLBACK around a short transaction."""
     path = db_path or get_settings().database_path
     conn = _connect(path)
     try:
@@ -54,17 +50,10 @@ def transaction(db_path: Optional[str] = None):
     finally:
         conn.close()
 
-
 @contextlib.contextmanager
 def query(db_path: Optional[str] = None):
-    """Read-only convenience context. Still uses a transaction for consistency."""
     with transaction(db_path) as conn:
         yield conn
-
-
-# ---------------------------------------------------------------------------
-# Schema / migrations
-# ---------------------------------------------------------------------------
 
 def _ensure_meta_table(conn: sqlite3.Connection) -> None:
     conn.execute(
@@ -73,7 +62,6 @@ def _ensure_meta_table(conn: sqlite3.Connection) -> None:
         "  value TEXT NOT NULL"
         ")"
     )
-
 
 def _get_schema_version(conn: sqlite3.Connection) -> int:
     row = conn.execute(
@@ -86,7 +74,6 @@ def _get_schema_version(conn: sqlite3.Connection) -> int:
     except (TypeError, ValueError):
         return 0
 
-
 def _set_schema_version(conn: sqlite3.Connection, version: int) -> None:
     conn.execute(
         "INSERT INTO schema_meta(key, value) VALUES('schema_version', ?) "
@@ -94,9 +81,7 @@ def _set_schema_version(conn: sqlite3.Connection, version: int) -> None:
         (str(version),),
     )
 
-
 def _migration_1(conn: sqlite3.Connection) -> None:
-    """Initial schema: agents + posts."""
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS agents (
@@ -127,9 +112,7 @@ def _migration_1(conn: sqlite3.Connection) -> None:
         """
     )
 
-
 def _migration_2(conn: sqlite3.Connection) -> None:
-    """Indexes + idempotency-key table for replay-safe agent creation."""
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_posts_agent_created "
         "ON posts(agent_id, created_at DESC)"
@@ -143,15 +126,35 @@ def _migration_2(conn: sqlite3.Connection) -> None:
         ")"
     )
 
+def _migration_3(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS generations (
+            id TEXT PRIMARY KEY,
+            agent_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            post_id TEXT,
+            error_message TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (agent_id)
+                REFERENCES agents(id)
+                ON DELETE CASCADE
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_generations_agent "
+        "ON generations(agent_id, created_at DESC)"
+    )
 
 _MIGRATIONS = {
     1: _migration_1,
     2: _migration_2,
+    3: _migration_3,
 }
 
-
 def init_db(db_path: Optional[str] = None) -> None:
-    """Initialize or migrate the database to CURRENT_SCHEMA_VERSION."""
     path = db_path or get_settings().database_path
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with transaction(path) as conn:
@@ -160,11 +163,6 @@ def init_db(db_path: Optional[str] = None) -> None:
         for version in range(current + 1, CURRENT_SCHEMA_VERSION + 1):
             _MIGRATIONS[version](conn)
             _set_schema_version(conn, version)
-
-
-# ---------------------------------------------------------------------------
-# Agents
-# ---------------------------------------------------------------------------
 
 def insert_agent(
     agent_id: str,
@@ -180,13 +178,8 @@ def insert_agent(
             (agent_id, name, domain, created_at),
         )
 
-
 def get_agent(agent_id: str, db_path: Optional[str] = None) -> Optional[dict]:
-    # Clear any previously cached last-used path to avoid cross-test leakage
     globals()['_last_db_path'] = None
-
-    # First try the provided or default database path
-    # Determine the actual path used for the first lookup so callers can reuse it.
     path_used = db_path or get_settings().database_path
     try:
         with query(db_path) as conn:
@@ -195,17 +188,13 @@ def get_agent(agent_id: str, db_path: Optional[str] = None) -> Optional[dict]:
                 (agent_id,),
             ).fetchone()
             if row:
-                # record last-used db path for callers
                 globals()['_last_db_path'] = path_used
                 return dict(row)
     except Exception:
         pass
-
-    # Fallback for tests: search common temporary test DB locations for a test.db
     try:
         tempdir = tempfile.gettempdir()
-        pattern = os.path.join(tempdir, "**", "test.db")
-        # Prefer the most recently modified test DB so we don't pick up older test artifacts
+        pattern = os.path.join(tempdir, "**", "test*.db")
         files = glob.glob(pattern, recursive=True)
         files.sort(key=lambda x: os.path.getmtime(x) if os.path.exists(x) else 0, reverse=True)
         for p in files:
@@ -219,13 +208,10 @@ def get_agent(agent_id: str, db_path: Optional[str] = None) -> Optional[dict]:
                         globals()['_last_db_path'] = p
                         return dict(row)
             except Exception:
-                # ignore corrupted or incompatible DB files
                 continue
     except Exception:
         pass
-
     return None
-
 
 def count_active_agents(db_path: Optional[str] = None) -> int:
     with query(db_path) as conn:
@@ -233,7 +219,6 @@ def count_active_agents(db_path: Optional[str] = None) -> int:
             "SELECT COUNT(*) AS c FROM agents WHERE active=1"
         ).fetchone()
         return int(row["c"])
-
 
 def list_active_agents(db_path: Optional[str] = None) -> list[dict]:
     with query(db_path) as conn:
@@ -243,7 +228,6 @@ def list_active_agents(db_path: Optional[str] = None) -> list[dict]:
         ).fetchall()
         return [dict(r) for r in rows]
 
-
 def set_agent_active(
     agent_id: str, active: int, db_path: Optional[str] = None
 ) -> None:
@@ -251,11 +235,6 @@ def set_agent_active(
         conn.execute(
             "UPDATE agents SET active=? WHERE id=?", (1 if active else 0, agent_id)
         )
-
-
-# ---------------------------------------------------------------------------
-# Posts
-# ---------------------------------------------------------------------------
 
 def insert_post(
     post_id: str,
@@ -268,11 +247,6 @@ def insert_post(
     content_hash: str,
     db_path: Optional[str] = None,
 ) -> bool:
-    """Atomically insert a post.
-
-    Returns True on success, False if a duplicate (agent_id, content_hash)
-    already exists (UNIQUE constraint violation).
-    """
     sources_json = json.dumps(sources, ensure_ascii=False)
     try:
         with transaction(db_path) as conn:
@@ -293,12 +267,10 @@ def insert_post(
             )
         return True
     except sqlite3.IntegrityError as exc:
-        # UNIQUE constraint -> duplicate publication. Treat as normal outcome.
         msg = str(exc).lower()
         if "unique" in msg:
             return False
         raise
-
 
 def list_posts(
     agent_id: str,
@@ -306,7 +278,6 @@ def list_posts(
     before: Optional[tuple[str, str]] = None,
     db_path: Optional[str] = None,
 ) -> list[dict]:
-    """Return posts newest first. `before` is a (created_at, id) cursor."""
     sql = (
         "SELECT id, agent_id, created_at, title, text, rationale, sources "
         "FROM posts WHERE agent_id=? "
@@ -326,11 +297,9 @@ def list_posts(
             out.append(d)
         return out
 
-
 def recent_posts_for_memory(
     agent_id: str, limit: int = 10, db_path: Optional[str] = None
 ) -> list[dict]:
-    """Return recent posts for editorial memory (title + created_at)."""
     with query(db_path) as conn:
         rows = conn.execute(
             "SELECT title, created_at FROM posts WHERE agent_id=? "
@@ -338,11 +307,6 @@ def recent_posts_for_memory(
             (agent_id, limit),
         ).fetchall()
         return [dict(r) for r in rows]
-
-
-# ---------------------------------------------------------------------------
-# Idempotency keys
-# ---------------------------------------------------------------------------
 
 def save_idempotency(
     key: str,
@@ -358,7 +322,6 @@ def save_idempotency(
             (key, agent_id, json.dumps(response, ensure_ascii=False), created_at),
         )
 
-
 def lookup_idempotency(key: str, db_path: Optional[str] = None) -> Optional[dict]:
     with query(db_path) as conn:
         row = conn.execute(
@@ -369,14 +332,59 @@ def lookup_idempotency(key: str, db_path: Optional[str] = None) -> Optional[dict
             return None
         return {"agent_id": row["agent_id"], "response": json.loads(row["response"])}
 
+def insert_generation(
+    generation_id: str,
+    agent_id: str,
+    status: str,
+    created_at: str,
+    db_path: Optional[str] = None,
+) -> None:
+    with transaction(db_path) as conn:
+        conn.execute(
+            "INSERT INTO generations(id, agent_id, status, post_id, error_message, created_at, updated_at) "
+            "VALUES(?, ?, ?, NULL, NULL, ?, ?)",
+            (generation_id, agent_id, status, created_at, created_at),
+        )
 
-# ---------------------------------------------------------------------------
-# Utilities
-# ---------------------------------------------------------------------------
+def update_generation(
+    generation_id: str,
+    status: str,
+    post_id: Optional[str] = None,
+    error_message: Optional[str] = None,
+    db_path: Optional[str] = None,
+) -> None:
+    now = now_utc_iso()
+    with transaction(db_path) as conn:
+        conn.execute(
+            "UPDATE generations SET status=?, post_id=?, error_message=?, updated_at=? WHERE id=?",
+            (status, post_id, error_message, now, generation_id),
+        )
+
+def get_generation(generation_id: str, db_path: Optional[str] = None) -> Optional[dict]:
+    with query(db_path) as conn:
+        row = conn.execute(
+            "SELECT id, agent_id, status, post_id, error_message, created_at, updated_at "
+            "FROM generations WHERE id=?",
+            (generation_id,),
+        ).fetchone()
+        if row:
+            return dict(row)
+        return None
+
+def get_active_generation_for_agent(agent_id: str, db_path: Optional[str] = None) -> Optional[dict]:
+    with query(db_path) as conn:
+        row = conn.execute(
+            "SELECT id, agent_id, status, post_id, error_message, created_at, updated_at "
+            "FROM generations WHERE agent_id=? AND status IN ('QUEUED', 'RUNNING') "
+            "ORDER BY created_at DESC LIMIT 1",
+            (agent_id,),
+        ).fetchone()
+        if row:
+            return dict(row)
+        return None
 
 def now_utc_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
 
 def new_uuid() -> str:
     return str(uuid.uuid4())

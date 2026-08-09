@@ -87,12 +87,6 @@
       gap: 18px;
     }
 
-    .controls-grid {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 16px;
-    }
-
     .control-group {
       display: flex;
       flex-direction: column;
@@ -216,13 +210,6 @@
       background: rgba(34, 197, 94, 0.08);
     }
 
-    .pill.pill-warning {
-      border-color: rgba(245, 158, 11, 0.3);
-      color: #fbbf24;
-      background: rgba(245, 158, 11, 0.08);
-    }
-
-    /* Rationale Box */
     .rationale-box {
       background: rgba(245, 158, 11, 0.08);
       border-left: 4px solid #f59e0b;
@@ -238,9 +225,6 @@
       letter-spacing: 1px;
       color: #fbbf24;
       margin-bottom: 6px;
-      display: flex;
-      align-items: center;
-      gap: 6px;
     }
 
     .rationale-text {
@@ -264,29 +248,7 @@
       color: #e2e8f0;
       margin-bottom: 24px;
       font-size: 15px;
-    }
-
-    .takeaways-list {
-      list-style: none;
-      margin-bottom: 24px;
-      display: flex;
-      flex-direction: column;
-      gap: 10px;
-    }
-
-    .takeaways-list li {
-      position: relative;
-      padding-left: 24px;
-      font-size: 14px;
-      color: #cbd5e1;
-      line-height: 1.5;
-    }
-
-    .takeaways-list li::before {
-      content: "⚡";
-      position: absolute;
-      left: 0;
-      font-size: 12px;
+      white-space: pre-wrap;
     }
 
     .result-footer {
@@ -332,28 +294,16 @@
       text-align: center;
       padding: 30px 20px;
       color: var(--text-muted);
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 20px;
+      display: none;
     }
 
     .no-posts .icon {
       font-size: 40px;
       margin-bottom: 12px;
       display: block;
-    }
-
-    /* Responsive */
-    @media (max-width: 600px) {
-      .controls-grid {
-        grid-template-columns: 1fr;
-      }
-      .header h1 {
-        font-size: 24px;
-      }
-      .result-card {
-        padding: 20px;
-      }
-      .result-headline {
-        font-size: 18px;
-      }
     }
   </style>
 </head>
@@ -363,33 +313,19 @@
     <div class="header">
       <h1>🧠 Autonomous Tech Insights Studio</h1>
       <p>Real-time engineering intelligence powered by Breeth AI</p>
-      <span class="badge">🤖 Agent: TechSage</span>
+      <span class="badge">🤖 Agent Active</span>
     </div>
 
     <div class="control-card">
-      <div class="controls-grid">
-        <div class="control-group">
-          <label for="category">📂 Category</label>
-          <select id="category" class="control-select">
-            <option value="all">All Tech</option>
-            <option value="ai">AI / Machine Learning</option>
-            <option value="systems">Systems & Performance</option>
-            <option value="security">Cybersecurity</option>
-          </select>
-        </div>
-
-        <div class="control-group">
-          <label for="persona">🎯 Persona Filter</label>
-          <select id="persona" class="control-select">
-            <option value="ai_architect">AI Systems Architect</option>
-            <option value="security_analyst">Security Specialist</option>
-            <option value="executive">Tech Executive</option>
-          </select>
-        </div>
+      <div class="control-group">
+        <label for="agent-id">📂 Target Agent ID</label>
+        <select id="agent-id" class="control-select">
+          <option value="tech_sage_default">TechSage Agent</option>
+        </select>
       </div>
 
-      <button id="generate-btn" class="btn-submit" onclick="generateBriefing()">
-        ⚡ Generate Latest Briefing
+      <button id="generate-btn" class="btn-submit" onclick="triggerPipeline()">
+        ⚡ Run Publishing Pipeline
       </button>
     </div>
 
@@ -399,63 +335,54 @@
       <h2 id="headline" class="result-headline"></h2>
 
       <div class="meta-pills">
-        <span id="persona-pill" class="pill"></span>
-        <span id="impact-pill" class="pill"></span>
-        <span id="domain-pill" class="pill"></span>
-        <span id="decision-pill" class="pill pill-success">✅ Published</span>
+        <span id="agent-pill" class="pill">Agent ID</span>
+        <span class="pill pill-success">✅ Published</span>
       </div>
 
-      <!-- Why Worth Publishing Box -->
       <div class="rationale-box">
-        <div class="rationale-title">⚡ Why Worth Publishing (Editorial Selection)</div>
-        <div id="rationale-text" class="rationale-text">
-          Waiting for agent analysis...
-        </div>
+        <div class="rationale-title">⚡ Editorial Rationale</div>
+        <div id="rationale-text" class="rationale-text"></div>
       </div>
 
+      <div class="section-title">📝 Generated Insight Briefing</div>
       <p id="briefing" class="briefing-text"></p>
 
-      <div class="section-title">📋 Key Engineering Takeaways</div>
-      <ul id="takeaways" class="takeaways-list"></ul>
-
       <div class="result-footer">
-        <a id="source-url" class="source-link" target="_blank" href="#">📄 Read original source context →</a>
+        <a id="source-url" class="source-link" target="_blank" href="#">📄 Read Source Reference →</a>
         <span id="timestamp" class="timestamp"></span>
       </div>
     </div>
 
-    <!-- Status message for when agent rejects all -->
-    <div id="no-posts" class="no-posts" style="display:none;">
+    <div id="no-posts" class="no-posts">
       <span class="icon">🔍</span>
-      <p>No candidates passed editorial standards.</p>
-      <p style="font-size:13px; margin-top:4px;">The agent will publish when it finds something worth saying.</p>
+      <p>Pipeline completed without publishing a new post.</p>
+      <p style="font-size:13px; margin-top:4px;">Either candidates were rejected or locks prevented concurrent runs.</p>
     </div>
   </div>
 
   <script>
-    async function generateBriefing() {
+    async function triggerPipeline() {
       const btn = document.getElementById('generate-btn');
       const resultCard = document.getElementById('result');
       const noPosts = document.getElementById('no-posts');
       const errorMsg = document.getElementById('error-message');
-      const category = document.getElementById('category').value;
-      const persona = document.getElementById('persona').value;
+      const agentId = document.getElementById('agent-id').value;
 
-      // Reset UI
+      // Reset UI state
       resultCard.style.display = 'none';
       noPosts.style.display = 'none';
       errorMsg.style.display = 'none';
       errorMsg.textContent = '';
 
-      // Show loading state
-      btn.innerHTML = '<span class="spinner"></span> Analyzing & Synthesizing...';
+      // Set Loading State
+      btn.innerHTML = '<span class="spinner"></span> Running Pipeline...';
       btn.disabled = true;
 
       try {
-        const response = await fetch('http://127.0.0.1:8000/api/agent/curate', {
+        const response = await fetch(`http://127.0.0.1:8000/api/agents/${agentId}/run`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ category, persona })
+          body: JSON.stringify({ trigger: 'MANUAL_STUDIO' })
         });
 
         if (!response.ok) {
@@ -465,72 +392,36 @@
 
         const data = await response.json();
 
-        // Check if we got a valid response with briefing
-        if (data.briefing && data.briefing.includes('No candidates') || data.headline.includes('No suitable')) {
+        if (!data || !data.post) {
           noPosts.style.display = 'block';
           return;
         }
 
-        // Populate the result card
-        document.getElementById('headline').innerText = data.headline || 'Tech Update';
-        document.getElementById('persona-pill').innerText = data.persona || persona;
-        document.getElementById('impact-pill').innerText = data.impact_score ? 'Impact: ' + data.impact_score : 'Impact: N/A';
-        document.getElementById('domain-pill').innerText = data.domain || 'tech';
+        // Bind data model correctly
+        document.getElementById('headline').innerText = data.post.title || 'Untitled Update';
+        document.getElementById('agent-pill').innerText = 'Agent: ' + agentId;
+        document.getElementById('rationale-text').innerText = data.post.rationale || 'Selected via automated workflow guidelines.';
+        document.getElementById('briefing').innerText = data.post.text || 'No content provided.';
+        
+        const sources = data.post.sources || [];
+        const primarySource = sources.length > 0 ? sources[0] : '#';
+        const sourceLink = document.getElementById('source-url');
+        sourceLink.href = primarySource;
+        sourceLink.style.display = primarySource !== '#' ? 'inline-block' : 'none';
 
-        // Rationale - use selection_rationale if available
-        const rationaleText = data.selection_rationale || data.why_worth_publishing || 'Selected by editorial agent based on technical relevance and timeliness.';
-        document.getElementById('rationale-text').innerText = rationaleText;
+        document.getElementById('timestamp').textContent = data.post.created_at || new Date().toLocaleString();
 
-        // Briefing text
-        document.getElementById('briefing').innerText = data.briefing || 'No briefing available.';
-
-        // Takeaways
-        const takeawaysList = document.getElementById('takeaways');
-        takeawaysList.innerHTML = '';
-        if (data.takeaways && data.takeaways.length > 0) {
-          data.takeaways.forEach(item => {
-            const li = document.createElement('li');
-            li.innerText = item;
-            takeawaysList.appendChild(li);
-          });
-        } else {
-          const li = document.createElement('li');
-          li.innerText = 'No specific takeaways available.';
-          takeawaysList.appendChild(li);
-        }
-
-        // Source URL
-        const sourceUrl = data.source_url || '#';
-        document.getElementById('source-url').href = sourceUrl;
-        document.getElementById('source-url').textContent = sourceUrl && sourceUrl !== '#' ? '📄 Read original source →' : '📄 No source available';
-
-        // Timestamp
-        document.getElementById('timestamp').textContent = data.generated_at || new Date().toLocaleString();
-
-        // Show the result
         resultCard.style.display = 'block';
 
       } catch (err) {
-        console.error('Error:', err);
-        errorMsg.textContent = '❌ ' + (err.message || 'Failed to generate briefing. Make sure the backend server is running at http://127.0.0.1:8000');
+        console.error('Pipeline Error:', err);
+        errorMsg.textContent = '❌ ' + (err.message || 'Failed to communicate with backend server.');
         errorMsg.style.display = 'block';
       } finally {
-        btn.innerHTML = '⚡ Generate Latest Briefing';
+        btn.innerHTML = '⚡ Run Publishing Pipeline';
         btn.disabled = false;
       }
     }
-
-    // Allow Enter key to trigger generation
-    document.addEventListener('DOMContentLoaded', function() {
-      const inputs = document.querySelectorAll('.control-select');
-      inputs.forEach(input => {
-        input.addEventListener('keydown', function(e) {
-          if (e.key === 'Enter') {
-            generateBriefing();
-          }
-        });
-      });
-    });
   </script>
 </body>
 </html>
