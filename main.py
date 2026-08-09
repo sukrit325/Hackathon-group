@@ -208,7 +208,7 @@ async def deactivate_agent(agent_id: str, _: None = Depends(require_api_key)):
     db.set_agent_active(agent_id, 0)
     return {"ok": True}
 
-static_path = Path("Agents/src/static")
+static_path = Path("Agents")
 if static_path.is_dir():
     app.mount("/static", StaticFiles(directory=str(static_path), html=True), name="static")
 
