@@ -3,7 +3,7 @@ Unit tests for validator.py
 """
 
 import pytest
-from src.validator import validate_decision
+from Agents.src.validator import validate_decision
 
 
 def test_valid_publish_decision():

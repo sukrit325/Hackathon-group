@@ -1,39 +1,27 @@
-#!/usr/bin/env python3
 """
-Autonomous Technology News Editor
-
-This script implements an editorial agent that evaluates technology-news candidates
-against strict editorial standards and recent publication history, then decides
-whether to publish a single post or reject all candidates.
-
-Usage:
-    echo '{"agent_name": "TechBot", "agent_domain": "blockchain security", "current_utc_time": "2026-08-08T12:00:00Z", "posting_history": [...], "candidates": [...]}' | python news_editor.py
-
-Or provide a JSON file:
-    python news_editor.py --input data.json
+Autonomous Technology News Editor - Using Breeth AI
 """
 
 import json
 import sys
 import argparse
 import os
+import aiohttp
+import asyncio
 from datetime import datetime
 from typing import Dict, Any, Optional, List
-from google import genai
-import textwrap
 from dotenv import load_dotenv
 
-load_dotenv()  # Load environment variables from .env file if present
-
+load_dotenv()
 
 # ---------- Configuration ----------
-# Set your OpenAI API key via environment variable OPENAI_API_KEY
-# Or pass it via a config file
-MODEL = "gemini-2.5-flash"
+BREETH_API_KEY = os.getenv("BREETH_API_KEY")
+BREETH_API_URL = os.getenv("BREETH_API_URL", "https://api.breeth.ai/v1/chat/completions")
+MODEL = "gemini-2.5-flash"  # Breeth might use different model names
 MAX_RETRIES = 3
 # -----------------------------------
 
-# The full system prompt from the specification (with placeholders)
+# ============== SYSTEM PROMPT TEMPLATE ==============
 SYSTEM_PROMPT_TEMPLATE = """
 # AUTONOMOUS TECHNOLOGY NEWS EDITOR
 
@@ -238,7 +226,7 @@ Do NOT choose a candidate merely because it has the most dramatic headline.
 
 If no candidate clearly satisfies the editorial threshold, return `REJECT`.
 
-
+---
 
 # 6. SOURCE INTEGRITY
 
@@ -262,8 +250,216 @@ Correct:
 "sources": [
   "https://example.com/article"
 ]
-"""  
 
+---
+
+# OUTPUT FORMAT
+
+Return a JSON object with the following structure:
+
+For PUBLISH:
+{
+  "decision": "PUBLISH",
+  "candidate_id": "cand_1",
+  "post": "Your 280-character post here...",
+  "rationale": "Brief explanation of why this was selected",
+  "sources": ["https://example.com/article"]
+}
+
+For REJECT:
+{
+  "decision": "REJECT",
+  "rationale": "Explanation of why all candidates were rejected",
+  "sources": []
+}
+"""
+
+# ============== MODULE FUNCTIONS ==============
+
+def build_system_prompt(agent_config: Dict[str, Any]) -> str:
+    """Build the system prompt from agent configuration."""
+    return SYSTEM_PROMPT_TEMPLATE.format(
+        agent_name=agent_config.get("agent_name", "DefaultEditor"),
+        agent_domain=agent_config.get("agent_domain", "general technology"),
+        current_utc_time=agent_config.get(
+            "current_utc_time", datetime.utcnow().isoformat() + "Z"
+        ),
+    )
+
+
+async def call_breeth_async(
+    system_prompt: str, 
+    user_payload: Dict[str, Any],
+    api_key: str = None,
+    api_url: str = None
+) -> Dict[str, Any]:
+    """
+    Call Breeth AI API asynchronously.
+    """
+    api_key = api_key or BREETH_API_KEY
+    api_url = api_url or BREETH_API_URL
+    
+    if not api_key:
+        raise ValueError("BREETH_API_KEY not set in environment variables")
+    
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+    
+    payload = {
+        "model": MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": json.dumps(user_payload, indent=2)}
+        ],
+        "temperature": 0.3,
+        "max_tokens": 1200,
+        "response_format": {"type": "json_object"}
+    }
+    
+    print(f"Calling Breeth API at: {api_url}")
+    print(f"Using model: {MODEL}")
+    
+    async with aiohttp.ClientSession() as session:
+        for attempt in range(MAX_RETRIES):
+            try:
+                async with session.post(
+                    api_url, 
+                    headers=headers, 
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=30)
+                ) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        content = result.get("choices", [{}])[0].get("message", {}).get("content", "{}")
+                        print(f"✅ Breeth response received: {len(content)} characters")
+                        return json.loads(content)
+                    else:
+                        error_text = await response.text()
+                        print(f"API error (attempt {attempt + 1}): {response.status} - {error_text}")
+                        if attempt < MAX_RETRIES - 1:
+                            await asyncio.sleep(2 ** attempt)
+                        else:
+                            raise Exception(f"API call failed: {response.status} - {error_text}")
+            except Exception as e:
+                print(f"Request error (attempt {attempt + 1}): {e}")
+                if attempt < MAX_RETRIES - 1:
+                    await asyncio.sleep(2 ** attempt)
+                else:
+                    raise
+
+
+def call_llm(payload: Dict[str, Any], agent_config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Synchronous wrapper for Breeth AI call.
+    """
+    system_prompt = build_system_prompt(agent_config)
+    
+    try:
+        # Run async function in sync context
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            result = loop.run_until_complete(
+                call_breeth_async(system_prompt, payload)
+            )
+            return result
+        finally:
+            loop.close()
+    except Exception as e:
+        print(f"Error communicating with Breeth AI: {e}", file=sys.stderr)
+        raise
+
+
+def validate_decision(decision: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate the decision format."""
+    if "decision" not in decision:
+        return {"valid": False, "error": "Missing 'decision' field"}
+    
+    if decision["decision"] not in ["PUBLISH", "REJECT"]:
+        return {"valid": False, "error": f"Invalid decision: {decision['decision']}"}
+    
+    if decision["decision"] == "PUBLISH":
+        required = ["post", "rationale", "sources", "candidate_id"]
+        missing = [f for f in required if f not in decision]
+        if missing:
+            return {"valid": False, "error": f"Missing fields: {missing}"}
+        
+        if len(decision.get("post", "")) > 280:
+            return {"valid": False, "error": "Post exceeds 280 characters"}
+    
+    return {"valid": True, "error": None}
+
+
+# ============== AGENT CLASS ==============
+
+class NewsEditorAgent:
+    """Autonomous Technology News Editor Agent using Breeth AI"""
+    
+    def __init__(self, agent_config: Optional[Dict[str, Any]] = None):
+        self.agent_config = agent_config or {}
+        self.api_key = os.getenv("BREETH_API_KEY")
+        self.api_url = os.getenv("BREETH_API_URL", "https://api.breeth.ai/v1/chat/completions")
+        
+        if not self.api_key:
+            print("⚠️ Warning: BREETH_API_KEY not set in environment", file=sys.stderr)
+    
+    def build_system_prompt(self) -> str:
+        """Build system prompt for this agent instance."""
+        return build_system_prompt(self.agent_config)
+    
+    async def call_llm_async(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Async LLM call with Breeth."""
+        system_prompt = self.build_system_prompt()
+        return await call_breeth_async(
+            system_prompt, 
+            payload,
+            self.api_key,
+            self.api_url
+        )
+    
+    def call_llm(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Synchronous LLM call with Breeth."""
+        return call_llm(payload, self.agent_config)
+    
+    def validate_decision(self, decision: Dict[str, Any]) -> Dict[str, Any]:
+        """Validate decision."""
+        return validate_decision(decision)
+    
+    def evaluate_and_select(self, candidates: List[Dict], history: List[Dict]) -> Dict[str, Any]:
+        """
+        Main method: evaluate candidates and select one or reject all.
+        """
+        payload = {
+            "candidates": candidates,
+            "posting_history": history
+        }
+        
+        full_payload = {**self.agent_config, **payload}
+        
+        try:
+            decision = self.call_llm(full_payload)
+            
+            validation = self.validate_decision(decision)
+            if not validation["valid"]:
+                return {
+                    "decision": "REJECT",
+                    "rationale": f"Invalid decision format: {validation['error']}",
+                    "sources": []
+                }
+            
+            return decision
+        except Exception as e:
+            print(f"Agent evaluation error: {e}", file=sys.stderr)
+            return {
+                "decision": "REJECT",
+                "rationale": f"Agent error: {str(e)}",
+                "sources": []
+            }
+
+
+# ============== STANDALONE SCRIPT ==============
 
 def load_input(input_path: Optional[str] = None) -> Dict[str, Any]:
     """Load input payload from file or stdin."""
@@ -279,49 +475,29 @@ def load_input(input_path: Optional[str] = None) -> Dict[str, Any]:
 
 
 def main():
+    """Standalone script entry point."""
     parser = argparse.ArgumentParser(description="Autonomous Technology News Editor")
     parser.add_argument("--input", type=str, help="Path to input JSON file")
     args = parser.parse_args()
 
-    # 1. Load input data
     payload = load_input(args.input)
 
-    agent_name = payload.get("agent_name", "DefaultEditor")
-    agent_domain = payload.get("agent_domain", "general technology")
-    current_utc_time = payload.get(
-        "current_utc_time", datetime.utcnow().isoformat() + "Z"
+    agent_config = {
+        "agent_name": payload.get("agent_name", "DefaultEditor"),
+        "agent_domain": payload.get("agent_domain", "general technology"),
+        "current_utc_time": payload.get(
+            "current_utc_time", datetime.utcnow().isoformat() + "Z"
+        ),
+    }
+
+    agent = NewsEditorAgent(agent_config)
+    decision = agent.evaluate_and_select(
+        candidates=payload.get("candidates", []),
+        history=payload.get("posting_history", [])
     )
+    
+    print(json.dumps(decision, indent=2))
 
-    # 2. Format system prompt
-    system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
-        agent_name=agent_name,
-        agent_domain=agent_domain,
-        current_utc_time=current_utc_time,
-    )
-
-    # 3. Initialize Google Generative AI client
-    client = genai.GenerativeModel(MODEL)
-
-    # 4. Invoke LLM with candidates and posting history
-    try:
-        response = client.generate_content(
-            model=MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {
-                    "role": "user",
-                    "content": json.dumps(payload, indent=2),
-                },
-            ],
-            response_format={"type": "json_object"},
-        )
-
-        result = response.choices[0].message.content
-        print(result)
-
-    except Exception as e:
-        print(f"Error communicating with Google Generative AI: {e}", file=sys.stderr)
-        sys.exit(1)
 
 if __name__ == "__main__":
     main()

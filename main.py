@@ -26,9 +26,8 @@ from schemas import (
     FeedResponse,
 )
 
-# Import agent modules
-sys.path.insert(0, str(Path(__file__).parent / "Agents" / "src"))
-from Agents.src.news_editor import build_system_prompt, call_llm, validate_decision
+# REMOVE THIS IMPORT - worker.py handles the agent
+# from Agents.src.news_editor import build_system_prompt, call_llm, validate_decision
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
