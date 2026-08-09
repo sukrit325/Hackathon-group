@@ -14,11 +14,11 @@ from typing import Optional
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from uvicorn import lifespan
 
 import db
 import worker
 from config import get_settings
-from llm import LLMError, get_provider
 from schemas import (
     AgentInitRequest,
     AgentInitResponse,
@@ -52,30 +52,11 @@ def require_api_key(x_api_key: Optional[str] = Header(default=None)) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Lifespan
-# ---------------------------------------------------------------------------
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    logger.info("initializing database")
-    db.init_db()
-    # Validate LLM provider config at startup (fail fast).
-    try:
-        get_provider()
-    except LLMError as exc:
-        logger.warning("LLM provider not ready at startup: %s", exc)
-    try:
-        yield
-    finally:
-        logger.info("shutdown complete")
-
-
-# ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
 
 app = FastAPI(title="Autonomous Publisher", lifespan=lifespan)
-
+    
 
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception):

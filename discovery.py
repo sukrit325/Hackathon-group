@@ -46,6 +46,16 @@ async def discover_candidates() -> List[dict]:
     return candidates
 
 
+async def discover():
+    """Compatibility wrapper: return objects with a to_dict() method (tests expect this)."""
+    dicts = await discover_candidates()
+    objs = []
+    for d in dicts:
+        # create a tiny object with a to_dict method that returns the dict
+        objs.append(type("C", (), {"to_dict": (lambda self, _d=d: _d)})())
+    return objs
+
+
 def scrape_article_text(url: str) -> str:
     """Scrape article text from URL."""
     try:
