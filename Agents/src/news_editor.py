@@ -17,7 +17,7 @@ import httpx
 
 BREETH_API_KEY = os.getenv("BREETH_API_KEY")
 BREETH_API_URL = os.getenv("BREETH_API_URL", "https://api.breeth.ai/v1/chat/completions")
-MODEL = "gemini-2.5-flash"
+MODEL = "gpt-4o-mini"
 MAX_RETRIES = 3
 
 SYSTEM_PROMPT_TEMPLATE = """
