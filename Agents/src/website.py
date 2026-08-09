@@ -246,7 +246,8 @@ async def list_agents():
     agents = db.list_active_agents()
     return {"agents": agents}
 
-static_dir = Path(__file__).parent / "static"
+# Updated path to point to the 'hackathon-group' folder where index.html is located
+static_dir = project_root / "hackathon-group"
 if static_dir.is_dir():
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
@@ -255,14 +256,14 @@ async def root():
     index_file = static_dir / "index.html"
     if index_file.is_file():
         return FileResponse(str(index_file))
-    return JSONResponse(status_code=500, content={"detail": "static/index.html not found"})
+    return JSONResponse(status_code=500, content={"detail": "hackathon-group/index.html not found"})
 
 @app.get("/index.html")
 async def index():
     index_file = static_dir / "index.html"
     if index_file.is_file():
         return FileResponse(str(index_file))
-    return JSONResponse(status_code=500, content={"detail": "static/index.html not found"})
+    return JSONResponse(status_code=500, content={"detail": "hackathon-group/index.html not found"})
 
 if __name__ == "__main__":
     import uvicorn
